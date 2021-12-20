@@ -136,7 +136,6 @@ def delete_servers():
     # если серверы есть в списке, начинаем процесс удаления
     if servers_info[1]:
         servers_id = [a['ctid'] for a in servers_info[1]]
-        print(servers_id)
         jobs = [pool.spawn(vds.remove_server, api_token, api_scalets_url, s) for s in servers_id]
         pool.join(raise_error=False)
         result = [j.value for j in jobs]
