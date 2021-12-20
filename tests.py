@@ -8,7 +8,7 @@ from main import app
 class TestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        api_token = '7bb2b18b2863063c5fbd8f44020c26c46d594c092f3e0d1e456c990423732a4c'
+        api_token = 'add_vds_api_token_here'
         manage_api_url = '/manage'
         tester = app.test_client()
         tester.post(f'{manage_api_url}?amount=1',
@@ -16,7 +16,7 @@ class TestCase(unittest.TestCase):
         sleep(5)
 
     def setUp(self):
-        self.api_token = '7bb2b18b2863063c5fbd8f44020c26c46d594c092f3e0d1e456c990423732a4c'
+        self.api_token = 'add_vds_api_token_here'
         self.s_api_url = 'https://api.vscale.io/v1/scalets'
         self.manage_api_url = '/manage'
         self.tester = app.test_client()
