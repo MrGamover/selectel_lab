@@ -1,42 +1,24 @@
+from gevent.pool import Pool
+from gevent import monkey
+import manage_vds as vds
 import configparser
-from threading import Thread
-
 import gevent
 
-import manage_vds as vds
-from time import sleep
-from gevent.pool import Pool
-from gevent import monkey, thread
-import sqlite3
-
 monkey.patch_all(ssl=False, httplib=True)
-CONCURRENCY = 5  # количество параллельных потоков
+CONCURRENCY = 10  # количество параллельных потоков
 pool = Pool(CONCURRENCY)
-
-def dict_factory(cursor, row):
-    d = {}
-    for idx, col in enumerate(cursor.description):
-        d[col[0]] = row[idx]
-    return d
-
-def internal_db_conn():
-    conn = sqlite3.connect('api_db')
-    conn.row_factory = dict_factory
-    return conn
 
 
 def check_delay_vm():
+    """function for checking order of delayed requests for create server"""
 
     while True:
-        cn = internal_db_conn()
+        cn = vds.internal_db_conn(db_path=internal_db_name)
         c = cn.cursor()
-        print(10)
         with open('tst', 'w') as f:
             f.write('123')
         c.execute('select * from delayed_create')
         delayed_create = c.fetchall()
-        if delayed_create:
-            print('find')
         jobs = [pool.spawn(vds.create_server,
                            name=d['name'],
                            token=d['api_token'],
@@ -56,9 +38,11 @@ def check_delay_vm():
 
 
 def check_remove():
+    """function for checking order of delayed requests for remove server"""
+
     while True:
-        print(1)
-        cn = internal_db_conn()
+
+        cn = vds.internal_db_conn(db_path=internal_db_name)
         c = cn.cursor()
         c.execute('select * from need_remove')
         need_remove = c.fetchall()
@@ -68,7 +52,6 @@ def check_remove():
                            server_id=n['ctid']) for n in need_remove]
         pool.join(raise_error=False)
         result = [j.value for j in jobs]
-        print(result)
 
         for r in result:
             if r[0] == 'success':
@@ -82,9 +65,12 @@ config = configparser.ConfigParser()
 config.read('conf.conf')
 api_url = config['MAIN']['api_address']
 service_name = config['MAIN']['service_name']
+internal_db_name = config['MAIN']['db_name']
 
 api_scalets_url = f'{api_url}/scalets'
 
+# проверяем таблицы для очередей отложенного создания/удаления и создаём их при необходимости
+vds.db_struct_create(db_path=internal_db_name)
 
 gevent.joinall([
     gevent.spawn(check_delay_vm),

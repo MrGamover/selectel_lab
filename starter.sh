@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# Start the first process
+# Start checkers process
 python delay_checker.py &
 
-# Start the second process
+# Start gunicorn process
 gunicorn --workers 3 --bind 0.0.0.0:5000 wsgi:app
 
 # Wait for any process to exit

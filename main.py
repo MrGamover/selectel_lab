@@ -1,12 +1,10 @@
 import configparser
 from collections import OrderedDict
-from gevent.threadpool import ThreadPool
 from flask import Flask, request
 from datetime import datetime
 from gevent.pool import Pool
 from gevent import monkey
 import manage_vds as vds
-import sqlite3
 import logging
 
 monkey.patch_all(ssl=False, httplib=True)
@@ -29,12 +27,11 @@ def setup_logger(name, log_file, level=logging.INFO):
 
 @app.route("/")
 def hello():
-    return "service_started"
+    return "service_started", 200
 
 
 @app.route('/manage', methods=['POST'])
 def create_servers():
-    print(request.args)
     api_token = request.headers.get('X-Token', None)
     servers_amount = int(request.args.get('amount', 0))
     if servers_amount:
@@ -42,7 +39,7 @@ def create_servers():
         # (либо из кэша, если получали недавно)
         def_settings = cache.get('serv_def_settings', None)
         if def_settings is None:
-            print('not from cache')
+            api_logger.info('default settings not from cache')
             settings = vds.get_default_settings(token=api_token,
                                                 address=api_plans_url)
             if settings:
@@ -51,19 +48,15 @@ def create_servers():
                 cache['serv_def_settings'] = default_settings
             def_settings = cache['serv_def_settings']
         else:
-            if (datetime.now() - def_settings.get('timestamp')).seconds < 30:
+            if (datetime.now() - def_settings.get('timestamp')).seconds < 14400:
                 def_settings = cache['serv_def_settings']
             else:
                 settings = vds.get_default_settings(token=api_token,
                                                     address=api_plans_url)
                 if settings:
                     cache['serv_def_settings'] = settings
-                else:
-                    cache['serv_def_settings'] = default_settings
-                def_settings = cache['serv_def_settings']
-                print('not from cache(timeout)')
 
-        a = datetime.now()
+                def_settings = cache['serv_def_settings']
 
         # Добавляем в gevent pool запросы на создание указанного количества серверов (servers_amount)
         jobs = [pool.spawn(vds.create_server,
@@ -74,9 +67,6 @@ def create_servers():
                            location=def_settings['location']) for _ in range(servers_amount)]
         pool.join(raise_error=False)
         result = [j.value for j in jobs]
-        print(result)
-
-        print(datetime.now() - a)
 
         # в зависимости от результатов выполнения записываем их в соответствующие переменные
         delayed = [r[1] for r in result if r[0] == 'try_later']
@@ -84,16 +74,15 @@ def create_servers():
         failed = [r[1] for r in result if r[0] in ('failed', 'remote_address_unavailable')]
         if len([r[1] for r in result if r[0] == 'remote_address_unavailable']) == len(result):
             fail_message = fail_message_template | dict(error='VDS_API_unavailable')
-            return fail_message, 403
+            api_logger.error('all request failed: VDS_API_unavailable')
+            return fail_message, 503
 
         # если в результате запросов есть хотя бы один со статусом failed,
         # то удаляем созданные в рамках этой сессии серверы и возвращаем ответ с неудачей :(
         if len(failed) > 0 and len(successed) > 0:
-            rm_pool = ThreadPool(10)
-            print('rm')
             for vm in successed:
                 vm['api_token'] = api_token
-                cn = internal_db_conn()
+                cn = vds.internal_db_conn(db_path=internal_db_name)
                 c = cn.cursor()
                 columns = ', '.join(vm.keys())
                 placeholders = ':' + ', :'.join(vm.keys())
@@ -104,13 +93,13 @@ def create_servers():
                               token=api_token,
                               address=api_scalets_url,
                               server_id=vm['ctid'])'''
-
+            api_logger.error('some request failed, remove created machine')
             return fail_message_template, 403
 
         # если есть серверы, запрос по которым вернулся в статусе try_later (код 429),
         # то записываем их в БД в таблицу отложенных заданий
         if delayed:
-            cn = internal_db_conn()
+            cn = vds.internal_db_conn(db_path=internal_db_name)
             c = cn.cursor()
             for d in delayed:
                 d['api_token'] = api_token
@@ -127,10 +116,11 @@ def create_servers():
 
         success_message = success_message_template | r_dict
 
-        return success_message
+        return success_message, 200
     else:
         fail_message = fail_message_template | dict(error='empty_param: amount')
-        return fail_message
+        api_logger.error('empty amount parameters')
+        return fail_message, 400
 
 
 @app.route('/manage', methods=['DELETE'])
@@ -138,14 +128,15 @@ def delete_servers():
     api_token = request.headers.get('X-Token', None)
     servers_info = vds.get_servers_state_list(token=api_token,
                                               address=api_scalets_url)
+    if servers_info[0] == 'remote_address_unavailable':
+        api_logger.error('getting servers list for remove failed: VDS_API_unavailable')
+        fail_message = fail_message_template | dict(error='VDS_API_unavailable')
+        return fail_message, 503
 
+    # если серверы есть в списке, начинаем процесс удаления
     if servers_info[1]:
-        print(servers_info[1])
         servers_id = [a['ctid'] for a in servers_info[1]]
         print(servers_id)
-
-        a = datetime.now()
-
         jobs = [pool.spawn(vds.remove_server, api_token, api_scalets_url, s) for s in servers_id]
         pool.join(raise_error=False)
         result = [j.value for j in jobs]
@@ -153,69 +144,57 @@ def delete_servers():
         delayed = [r[1] for r in result if r[0] == 'try_later']
         successed = [r[1] for r in result if r[0] == 'success']
 
-        print(datetime.now() - a)
-
         result = OrderedDict()
         if delayed:
             result['delayed'] = delayed
         result['successed'] = successed
         success_message = success_message_template | dict(result=result)
-        return success_message
+        return success_message, 200
     else:
+        # если серверов для удаления нет - сообщаем клиенту
         success_message = success_message_template | dict(message='nothing_delete')
-        return success_message
+        return success_message, 200
 
 
 @app.route('/manage', methods=['GET'])
 def get_servers():
+    # получаем список серверов и возвращаем их клиенту, либо возвращаем сообщения об ошибке в случае неудачи
     api_token = request.headers.get('X-Token', None)
 
-    if request.args:
-        if request.args.get('name', None):
-            pass
-    else:
-        servers_info = vds.get_servers_state_list(token=api_token,
-                                                  address=api_scalets_url)
-        if servers_info[0] == 'success':
-            # success_message = copy.deepcopy(success_message_template)
-            # success_message['data'] = servers_info[1]
-            success_message = success_message_template | dict(data=servers_info[1])
+    servers_info = vds.get_servers_state_list(token=api_token,
+                                              address=api_scalets_url)
 
-            return success_message, 200
-        elif servers_info[0] == 'remote_address_unavailable':
-            fail_message = fail_message_template | dict(error='vds_address_unavailable')
-            return fail_message, 500
-        elif servers_info[0] == 'failed':
-            fail_message = fail_message_template | dict(error='something_went_wrong')
-            return fail_message, 500
+    if servers_info[0] == 'success':
+        success_message = success_message_template | dict(data=servers_info[1])
+
+        return success_message, 200
+
+    elif servers_info[0] == 'remote_address_unavailable':
+        api_logger.error('getting servers list failed: VDS_API_unavailable')
+        fail_message = fail_message_template | dict(error='VDS_API_unavailable')
+        return fail_message, 503
+    elif servers_info[0] == 'failed':
+        api_logger.error('getting servers list failed: something went wrong')
+        fail_message = fail_message_template | dict(error='something_went_wrong')
+        return fail_message, 500
 
 
-def internal_db_conn():
-    conn = sqlite3.connect('api_db')
-    conn.row_factory = dict_factory
-    return conn
-
-
-def dict_factory(cursor, row):
-    d = {}
-    for idx, col in enumerate(cursor.description):
-        d[col[0]] = row[idx]
-    return d
-
-
-api_logger = setup_logger(name='api_full',
+# задаём параметры логирования
+api_logger = setup_logger(name='api_full_log',
                           log_file='full.log',
                           level=logging.DEBUG)
 
 CONCURRENCY = 10  # количество параллельных потоков
 pool = Pool(CONCURRENCY)
-cache = {}
+cache = {}  # переменная для хранения "кеша" настроек по умолчанию для новых серверов
 
 config = configparser.ConfigParser()
 config.read('conf.conf')
 api_url = config['MAIN']['api_address']
 service_name = config['MAIN']['service_name']
+internal_db_name = config['MAIN']['db_name']
 
+# настройки по умолчанию на случай, если не удастся получить их из публичного API
 default_settings = dict(location=config['VDS_SETTINGS']['location'],
                         plan=config['VDS_SETTINGS']['plan'],
                         template=config['VDS_SETTINGS']['template'],
@@ -230,25 +209,9 @@ success_message_template = OrderedDict(service_name=service_name,
 fail_message_template = OrderedDict(service_name=service_name,
                                     success=0, )
 
-cn = internal_db_conn()
-cur = cn.cursor()
-sql_delay_table = """ CREATE TABLE IF NOT EXISTS delayed_create (
-                                recreate_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                name text,
-                                make_from text NOT NULL,
-                                plan text,
-                                location text,
-                                password text,
-                                api_token text)"""
-cur.execute(sql_delay_table)
-sql_failed_remove_table = """CREATE TABLE IF NOT EXISTS need_remove (
-                                ctid INTEGER PRIMARY KEY,
-                                name text,
-                                status text,
-                                api_token text)"""
-cur.execute(sql_failed_remove_table)
-cn.commit()
+# проверяем таблицы для очередей отложенного создания/удаления и создаём их при необходимости
+vds.db_struct_create(db_path=internal_db_name)
 
 if __name__ == '__main__':
-    app.config["JSON_SORT_KEYS"] = False
+    app.config["JSON_SORT_KEYS"] = False  # отключаем принудительную сортировку json
     app.run(debug=True, threaded=True)
