@@ -82,6 +82,7 @@ def create_servers():
         if len(failed) > 0 and len(successed) > 0:
             for vm in successed:
                 vm['api_token'] = api_token
+                vm = {k: vm[k] for k in ('ctid', 'name', 'status', 'api_token')}
                 cn = vds.internal_db_conn(db_path=internal_db_name)
                 c = cn.cursor()
                 columns = ', '.join(vm.keys())
